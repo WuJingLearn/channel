@@ -143,11 +143,35 @@ SELECT * FROM t WHERE id > 5 AND id < 12 FOR UPDATE;
 **Q9：什么情况下 InnoDB 的行锁会退化为表锁？**
 
 A：
-1. **没有使用索引的查询**：`WHERE name = 'xxx'`（name 无索引） → 走全表扫描 → 锁住所有扫描到的行 ≈ 表锁
+
+**前提：只有"当前读"才会加锁，普通 SELECT 不加锁**
+
+普通 `SELECT` 走的是 **MVCC 快照读**，读历史版本数据，**完全不加锁**，无论有没有索引：
+```sql
+-- 不加任何锁，不存在退化为表锁的问题
+SELECT * FROM user WHERE name = 'xxx';
+```
+
+只有以下**当前读**操作才会加锁，才存在行锁退化为表锁的问题：
+```sql
+SELECT * FROM user WHERE name = 'xxx' FOR UPDATE;       -- 排他锁
+SELECT * FROM user WHERE name = 'xxx' LOCK IN SHARE MODE; -- 共享锁
+UPDATE user SET age = 18 WHERE name = 'xxx';            -- 排他锁
+DELETE FROM user WHERE name = 'xxx';                    -- 排他锁
+```
+
+**行锁退化为表锁的场景**：
+1. **没有使用索引**：`WHERE name = 'xxx'`（name 无索引） → 走全表扫描 → 锁住所有扫描到的行 ≈ 表锁
 2. **索引失效**：类型转换、函数操作等导致索引失效 → 同上
 3. 明确的 `LOCK TABLES` 语句
 
-**关键**：InnoDB 行锁是**加在索引上的**，不是加在数据行上。没有索引就无法精确加行锁。
+| 操作类型 | 有无索引 | 加锁情况 |
+|----------|----------|----------|
+| 普通 `SELECT` | 无所谓 | **不加锁**（MVCC 快照读） |
+| `FOR UPDATE` / `UPDATE` / `DELETE` | 有索引 | 精确行锁 |
+| `FOR UPDATE` / `UPDATE` / `DELETE` | **无索引** | **全表扫描 ≈ 表锁** |
+
+**关键**：InnoDB 行锁是**加在索引上的**，不是加在数据行上。当前读没有索引就无法精确加行锁，只能退化为表锁。
 
 ---
 
