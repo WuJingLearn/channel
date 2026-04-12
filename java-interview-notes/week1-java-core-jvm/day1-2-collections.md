@@ -167,12 +167,59 @@ A：
 **Q16：LinkedHashMap 如何实现有序？如何用它实现 LRU 缓存？**
 
 A：
-- LinkedHashMap 继承 HashMap，在每个 Entry 上额外维护 `before` 和 `after` 指针，构成**双向链表**
-- 两种排序模式（构造时指定 `accessOrder`）：
-  - `false`（默认）：**插入顺序**
-  - `true`：**访问顺序**（每次 get/put 都会将节点移到链表尾部）
 
-**LRU 实现**：
+**数据结构：HashMap + 双向链表**
+
+LinkedHashMap 继承 HashMap，在 HashMap 的哈希桶结构基础上，额外维护了一条贯穿所有节点的双向链表。HashMap 的 Node 节点只有 `next` 指针（指向同一桶内的下一个节点），而 LinkedHashMap 将 Node 扩展为 Entry，额外增加了 `before` 和 `after` 两个指针：
+
+```
+LinkedHashMap.Entry：hash | key | value | next（桶内链表）| before | after（双向链表）
+
+哈希桶（横向，负责 O(1) 查找）：
+  桶0 → Entry_A → Entry_D
+  桶1 → Entry_B
+  桶2 → Entry_C
+
+双向链表（纵向，负责维护顺序）：
+  head ↔ Entry_A ↔ Entry_B ↔ Entry_C ↔ Entry_D ↔ tail
+```
+
+两套结构共享同一批 Entry 对象，哈希桶负责 O(1) 查找，双向链表负责维护顺序。
+
+**两种排序模式**（构造时指定 `accessOrder`）：
+- `false`（默认）：**插入顺序**，get 不改变顺序
+- `true`：**访问顺序**，每次 get/put 都会将节点移到链表尾部
+
+**访问节点后如何更新链表（afterNodeAccess）**
+
+当 `accessOrder = true` 时，get 命中节点后，会将该节点从链表当前位置摘除，重新插入到链表尾部。整个过程**只改 4~5 个指针引用，是严格的 O(1)**，与链表长度无关：
+
+```
+当前链表：head ↔ A ↔ B ↔ C ↔ D ↔ tail，执行 get("B")
+
+第一步：摘除 B（只改 A 和 C 的指针）
+  A.after = C
+  C.before = A
+  → head ↔ A ↔ C ↔ D ↔ tail
+
+第二步：将 B 插入尾部（只改 B、D、tail 的指针）
+  B.before = D
+  B.after = tail
+  D.after = B
+  tail.before = B
+  → head ↔ A ↔ C ↔ D ↔ B ↔ tail
+```
+
+get 操作通过哈希桶已经直接拿到了节点引用，不需要在链表里遍历查找，所以摘除和插入都只是改指针，O(1) 完成。
+
+**LRU 缓存实现原理**
+
+LRU（最近最少使用）的语义：缓存满时淘汰最久未被访问的数据。LinkedHashMap 在 `accessOrder = true` 模式下天然满足：
+- **链表头部** = 最久未被访问的节点（最应该被淘汰的）
+- **链表尾部** = 最近刚被访问的节点（最应该被保留的）
+
+`removeEldestEntry()` 是预留的钩子方法，每次 `put` 后被调用，返回 `true` 则自动删除链表头部节点：
+
 ```java
 public class LRUCache<K, V> extends LinkedHashMap<K, V> {
     private final int capacity;
@@ -188,6 +235,17 @@ public class LRUCache<K, V> extends LinkedHashMap<K, V> {
     }
 }
 ```
+
+运行示例（容量为 3）：
+```
+put(1) → 链表：[1]
+put(2) → 链表：[1, 2]
+put(3) → 链表：[1, 2, 3]
+get(1) → 1 移到尾部 → 链表：[2, 3, 1]
+put(4) → 超出容量，淘汰头部节点 2 → 链表：[3, 1, 4]
+```
+
+所有操作（get/put/淘汰）均为 O(1)。注意：LinkedHashMap 线程不安全，生产中需要并发安全的 LRU 建议使用 **Caffeine**。
 
 ---
 

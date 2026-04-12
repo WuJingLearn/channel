@@ -17,6 +17,34 @@ A：
   - `_WaitSet`：调用 `wait()` 后进入等待的线程集合
 - 线程进入 synchronized 块时尝试获取 Monitor 的所有权，获取失败则进入 EntryList 阻塞
 
+**深入：未抢到锁的线程是如何变为阻塞状态的？**
+
+从 JVM 到操作系统的完整阻塞链路：
+
+```
+monitorenter 字节码
+  → JVM ObjectMonitor::enter()
+    → CAS 自旋尝试获取锁（轻量级锁阶段）
+    → 自旋失败，膨胀为重量级锁
+      → ObjectMonitor::EnterI()  // 将线程封装为 ObjectWaiter 加入 _EntryList
+        → os::PlatformEvent::park()  // JVM 平台抽象的线程挂起
+          → pthread_cond_wait()      // POSIX 条件变量等待（用户态）
+            → futex(FUTEX_WAIT)      // Linux 内核系统调用，线程真正阻塞
+```
+
+各层关键函数：
+
+| 层级 | 关键函数 | 作用 |
+|------|---------|------|
+| JVM C++ | `ObjectMonitor::EnterI()` | 自旋失败后将线程加入 EntryList |
+| JVM 平台层 | `os::PlatformEvent::park()` | 平台抽象的线程挂起 |
+| 用户态（glibc） | `pthread_cond_wait()` | POSIX 条件变量等待 |
+| 内核态（Linux） | `futex(FUTEX_WAIT)` | **真正让线程阻塞的系统调用**，线程进入 `TASK_INTERRUPTIBLE` 状态，从 CPU 运行队列移除 |
+
+唤醒过程（反向）：锁释放 `monitorexit` → `ObjectMonitor::exit()` → `unpark()` → `pthread_cond_signal()` → `futex(FUTEX_WAKE)` → 线程重新进入 CPU 运行队列。
+
+> 注意：`LockSupport.park()` 底层也走 `Unsafe.park()` → `os::PlatformEvent::park()` 同一路径，因此 `ReentrantLock` 的阻塞机制在操作系统层面与 `synchronized` 一致。这也是重量级锁开销大的根本原因——涉及用户态到内核态的上下文切换。
+
 ---
 
 **Q2：synchronized 锁升级的过程是怎样的？**
@@ -34,6 +62,101 @@ A：JDK 1.6 引入锁升级（只能升级，不能降级）：
 
 注意：JDK 15 之后偏向锁默认关闭（`-XX:-UseBiasedLocking`），因为现代应用多为高并发场景，偏向锁撤销的开销反而更大。
 
+**补充：Mark Word 是什么？**
+
+Mark Word 是 Java 对象头（Object Header）的核心部分，用于存储对象的运行时元数据，是 synchronized 锁机制的物理载体。
+
+对象在内存中的布局：
+- **对象头**：Mark Word（锁状态、hashCode、GC 信息）+ Klass Pointer（指向 Class 元数据）+ 数组长度（仅数组对象）
+- **实例数据**：对象的字段值
+- **对齐填充**：补齐到 8 字节整数倍
+
+Mark Word 在 64 位 JVM 下占 8 字节（64 bit），不同锁状态下存储内容完全不同：
+
+| 锁状态 | Mark Word 内容 | 偏向标志 | 锁标志位 |
+|--------|---------------|---------|---------|
+| 无锁 | unused:25 \| hashCode:31 \| unused:1 \| GC年龄:4 | 0 | 01 |
+| 偏向锁 | 线程ID:54 \| epoch:2 \| unused:1 \| GC年龄:4 | 1 | 01 |
+| 轻量级锁 | 指向栈中 Lock Record 的指针:62 | — | 00 |
+| 重量级锁 | 指向 ObjectMonitor 的指针:62 | — | 10 |
+| GC 标记 | 空（GC 标记阶段使用） | — | 11 |
+
+> 注意：hashCode 和偏向锁互斥——一旦对象调用了 `hashCode()`，Mark Word 中存储了 hashCode，就无法再进入偏向锁状态（空间被 hashCode 占用），会导致偏向锁撤销。
+
+**各锁状态的具体示例：**
+
+**① 无锁 → 偏向锁：单线程反复进入**
+
+```java
+Object lock = new Object();
+
+// 线程 A 第一次进入
+synchronized (lock) {
+    // CAS 将线程 A 的 ID 写入 Mark Word，升级为偏向锁
+    // Mark Word: [线程A的ID | epoch | GC年龄 | 偏向标志=1 | 锁标志=01]
+    doSomething();
+}
+
+// 线程 A 第二次进入
+synchronized (lock) {
+    // 只需检查 Mark Word 中的线程 ID == 当前线程 ID
+    // 匹配！直接进入，无需任何 CAS 操作 → 几乎零开销
+    doSomethingElse();
+}
+```
+
+**② 偏向锁 → 轻量级锁：两个线程交替进入（无同时竞争）**
+
+```java
+Object lock = new Object();
+
+// 线程 A 进入（lock 处于偏向锁，偏向线程 A）
+synchronized (lock) {
+    doWork();  // 执行完毕，退出同步块
+}
+
+// 线程 B 尝试进入
+synchronized (lock) {
+    // 发现 Mark Word 中线程 ID 是 A，不是自己
+    // 触发偏向锁撤销（需等到全局安全点 safepoint）
+    // 升级为轻量级锁：
+    //   1. 在线程 B 的栈帧中创建 Lock Record
+    //   2. CAS 将 Mark Word 替换为指向 Lock Record 的指针
+    //   3. CAS 成功 → 获取轻量级锁
+    // Mark Word: [指向 Lock Record 的指针 | 锁标志=00]
+    doOtherWork();
+}
+```
+
+**③ 轻量级锁 → 重量级锁：多线程同时竞争**
+
+```java
+public class HeavyweightLockDemo {
+    private static final Object lock = new Object();
+
+    public static void main(String[] args) {
+        for (int i = 0; i < 3; i++) {
+            final int threadId = i;
+            new Thread(() -> {
+                synchronized (lock) {
+                    // 线程 0 先拿到锁
+                    // 线程 1、2 CAS 自旋尝试获取轻量级锁 → 失败
+                    // 自旋次数超过阈值（JVM 自适应决定）
+                    // → 锁膨胀为重量级锁
+                    // Mark Word: [指向 ObjectMonitor 的指针 | 锁标志=10]
+                    // 线程 1、2 进入 ObjectMonitor._EntryList 阻塞
+                    // 底层：park() → pthread_cond_wait() → futex(FUTEX_WAIT)
+                    System.out.println("Thread-" + threadId + " acquired lock");
+                    try { Thread.sleep(100); } catch (InterruptedException e) {}
+                }
+            }).start();
+        }
+    }
+}
+```
+
+> 面试加分点：JVM 的自适应自旋（Adaptive Spinning）会根据上一次自旋是否成功来动态调整自旋次数——如果上次自旋成功获取了锁，JVM 会允许更多的自旋次数；反之则减少自旋甚至直接膨胀为重量级锁。
+
 ---
 
 **Q3：synchronized 和 ReentrantLock 有什么区别？**
@@ -48,6 +171,99 @@ A：
 | 条件变量 | 单一 wait/notify | 多个 Condition（精确唤醒） |
 | 尝试获取锁 | 不支持 | `tryLock()` / `tryLock(timeout)` |
 | 性能 | JDK 1.6 后优化很大，差距不明显 | 高竞争场景下略优 |
+
+**深入：ReentrantLock.lock() 获取锁的完整流程**
+
+`ReentrantLock` 没有锁升级的概念，但 `lock()` 过程也体现了**从轻到重的获取策略**——先 CAS 快速尝试，失败后入 CLH 队列，最终 `park()` 阻塞。
+
+以非公平锁（默认）为例，完整调用链路：
+
+```
+ReentrantLock.lock()
+  → NonfairSync.lock()
+    → ① CAS 尝试直接获取锁（快速路径）
+    → 失败 → AQS.acquire(1)
+      → ② tryAcquire()：再次 CAS 尝试 + 检查重入
+      → 失败 → ③ addWaiter()：封装为 Node 加入 CLH 等待队列
+        → ④ acquireQueued()：自旋 + park 阻塞 为什么要自旋：唤醒不表示一定能获取锁，非公平锁下可能会被一个新线程插队。
+          → LockSupport.park()
+            → Unsafe.park()
+              → os::PlatformEvent::park()  // 和 synchronized 底层一致
+                → pthread_cond_wait() → futex(FUTEX_WAIT)
+```
+
+**① 第一次 CAS（快速路径）**
+
+```java
+// NonfairSync.lock()
+final void lock() {
+    if (compareAndSetState(0, 1))  // CAS: state 从 0 → 1
+        setExclusiveOwnerThread(Thread.currentThread());  // 成功！设置持有线程
+    else
+        acquire(1);  // 失败，进入 AQS 流程
+}
+```
+
+`state` 是 AQS 的核心变量（`volatile int`），0 表示无锁，≥1 表示已被持有。CAS 成功则一次原子操作就拿到锁。
+
+**② tryAcquire()（再次尝试 + 重入检查）**
+
+```java
+final boolean nonfairTryAcquire(int acquires) {
+    Thread current = Thread.currentThread();
+    int currentState = getState();
+    if (currentState == 0) {
+        if (compareAndSetState(0, acquires)) {  // 锁刚好被释放，再次 CAS
+            setExclusiveOwnerThread(current);
+            return true;
+        }
+    } else if (current == getExclusiveOwnerThread()) {
+        int nextState = currentState + acquires;  // 重入！state + 1
+        setState(nextState);
+        return true;
+    }
+    return false;
+}
+```
+
+**③ addWaiter()（入队）**
+
+将当前线程封装为 Node，CAS 加入 CLH 双向链表队列尾部。
+
+**④ acquireQueued()（自旋 + 阻塞）**
+
+```java
+final boolean acquireQueued(final Node node, int arg) {
+    boolean interrupted = false;
+    for (;;) {  // 关键循环
+        final Node predecessor = node.predecessor();
+        if (predecessor == head && tryAcquire(arg)) {
+            // 前驱是 head，轮到自己了，尝试获取锁
+            setHead(node);
+            predecessor.next = null; // help GC
+            return interrupted;
+        }
+        if (shouldParkAfterFailedAcquire(predecessor, node))
+            interrupted |= parkAndCheckInterrupt();  // park() 阻塞
+        // 被 unpark() 唤醒后，回到 for 循环顶部重新竞争
+    }
+}
+```
+
+`for(;;)` 循环承担三重职责：
+
+| 循环目的 | 说明 |
+|---------|------|
+| 唤醒后重新竞争 | `unpark()` 唤醒 ≠ 获取锁，非公平锁下可能被新线程插队，需要重试 |
+| 前驱状态设置 | `shouldParkAfterFailedAcquire` 需要多轮将前驱设为 SIGNAL 才能安全 park |
+| 中断恢复 | 被 `interrupt()` 唤醒后不响应中断，继续循环尝试获取锁 |
+
+一次典型的执行流程：
+- **第 1 轮**：前驱 waitStatus=0 → CAS 设为 SIGNAL → 返回 false，不 park，继续循环
+- **第 2 轮**：前驱 waitStatus=SIGNAL → 返回 true → `park()` 阻塞 💤
+- **第 3 轮**（被唤醒后）：前驱是 head → `tryAcquire()` 成功 → 获取锁 ✅
+
+> 总结：synchronized 的锁升级在 JVM 内部自动完成（修改 Mark Word），而 ReentrantLock 的从轻到重策略在 Java 代码层面（AQS）显式实现。两者在操作系统层面的阻塞机制一致，都通过 `futex` 系统调用进入内核态。ReentrantLock 更灵活（支持公平锁、可中断、tryLock），synchronized 更简洁（自动释放、无需 try-finally）。
 
 ---
 
@@ -307,7 +523,7 @@ A：
 - 底层依赖 CPU 指令（如 x86 的 `CMPXCHG` + `LOCK` 前缀）
 - Java 中通过 `Unsafe` 类实现
 
-**三个问题**：
+**三个问题(注意事项)**：
 1. **ABA 问题**：值从 A → B → A，CAS 认为没变。解决：`AtomicStampedReference`（带版本号）
 2. **自旋开销**：竞争激烈时大量线程自旋消耗 CPU
 3. **只能保证单个变量的原子性**：多变量操作需要加锁或用 `AtomicReference` 封装
@@ -338,16 +554,27 @@ A：
 - JMM 定义了 8 种原子操作：lock、unlock、read、load、use、assign、store、write
 - 通过 happens-before 规则保证可见性和有序性
 
----
+**深入理解 JMM（面试回答）：**
 
-**Q24：什么是伪共享（False Sharing）？如何解决？**
+**JMM 是什么**：JMM（Java Memory Model）是 Java 语言规范（JSR-133）中定义的一套抽象模型，规定了多线程环境下共享变量的读写行为。它不是具体的内存区域划分（不是堆/栈），而是对底层硬件内存架构（CPU 多级缓存、Store Buffer）的抽象。
 
-A：
-- CPU 缓存以**缓存行**（通常 64 字节）为单位加载数据
-- 如果两个线程修改的变量位于同一缓存行，一方修改会导致另一方的缓存行失效（MESI 协议），引发频繁的缓存同步 → 性能下降
-- **解决方案**：
-  - `@sun.misc.Contended` 注解（JDK 8+，需 `-XX:-RestrictContended`）：自动填充缓存行
-  - 手动填充：在变量前后添加无用的 long 字段凑满 64 字节
+**为什么需要 JMM**：现代 CPU 为了弥补与主内存之间约 100 倍的速度差距（CPU 缓存 ~1ns vs 主内存 ~100ns），引入了 L1/L2/L3 多级缓存。每个 CPU 核心有私有的 L1/L2 缓存，线程对变量的读写实际在 CPU 缓存中进行。这带来了性能提升，但也引入了三个并发问题：
+
+| 问题 | 根因 | 示例 | JMM 解决手段 |
+|------|------|------|-------------|
+| **可见性** | CPU 多级缓存，各线程读自己缓存中的副本 | 线程 A 修改 flag=true，线程 B 看不到 | `volatile`（强制刷缓存）、`synchronized`（unlock 时刷缓存） |
+| **有序性** | 编译器/CPU 指令重排序 | DCL 单例中 new 操作被重排，读到未初始化对象 | `volatile`（内存屏障禁止重排序）、happens-before 规则 |
+| **原子性** | 线程切换导致操作被打断 | 两个线程同时 i++，结果只增加 1 | `synchronized`、`Lock`、`Atomic` 原子类 |
+
+**JMM 的核心机制——happens-before 规则**：定义了哪些操作之间存在可见性保证：
+- **程序顺序规则**：同一线程中，前面的操作 happens-before 后面的操作
+- **volatile 规则**：volatile 写 happens-before 后续的 volatile 读
+- **锁规则**：unlock happens-before 后续对同一把锁的 lock
+- **线程启动规则**：`Thread.start()` happens-before 该线程的所有操作
+- **线程终止规则**：线程的所有操作 happens-before `Thread.join()` 返回
+- **传递性**：A happens-before B，B happens-before C → A happens-before C
+
+> 总结：JMM 本质上是在"CPU 缓存带来的性能提升"和"多线程数据一致性"之间做平衡。它默认允许使用缓存，只在程序员通过 volatile、synchronized 等关键字显式声明时，才强制保证可见性和有序性，既保留了性能优势，又在需要的地方保证了线程安全。
 
 ---
 
