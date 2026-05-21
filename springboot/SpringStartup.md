@@ -3,6 +3,28 @@
 > 关注 **IoC 容器**（`ApplicationContext`）如何从 0 到 1 启动起来。
 > 核心就是一个方法：`AbstractApplicationContext#refresh()`，俗称 **"refresh 12 步"**。
 
+
+SpringApplication.run()
+        │
+        ▼
+1. 创建 SpringApplication 对象
+        │
+        ▼
+2. 创建 ApplicationContext (AnnotationConfigServletWebServerApplicationContext)
+        │
+        ▼
+3. refreshContext() ──► AbstractApplicationContext.refresh()
+        │
+        ├─► invokeBeanFactoryPostProcessors()  // 处理BeanDefinition
+        │
+        ├─► registerBeanPostProcessors()        // 注册Bean后置处理器
+        │
+        ├─► finishBeanFactoryInitialization()   // ★ 实例化所有单例Bean
+        │         └── 完成所有 @Bean、@Service、@Controller 等Bean创建
+        │
+        └─► finishRefresh()                     // ★ 启动Tomcat
+                  └── onRefresh() 已提前创建WebServer，此处start()
+
 ## 一、启动入口
 
 无论是传统 Spring 还是 SpringBoot，最终都会走到 `refresh()`：
@@ -28,7 +50,7 @@ public void refresh() throws BeansException, IllegalStateException {
 
         // 2. 创建 BeanFactory，加载 BeanDefinition
         ConfigurableListableBeanFactory beanFactory = obtainFreshBeanFactory();
-
+        
         // 3. BeanFactory 预处理
         prepareBeanFactory(beanFactory);
 

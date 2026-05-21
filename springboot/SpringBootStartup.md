@@ -508,7 +508,7 @@ SpringApplication.run(Application.class, args)
 |---|---|---|
 | 配置 | XML / Java Config | 约定大于配置 + `application.yml` |
 | 依赖管理 | 手动管理版本 | starter 一站式 |
-| Web 容器 | 部署到外部 Tomcat | 内嵌 Tomcat / Jetty / Undertow |
+| Web 容器 | 部署到外部 Tomcat | 内嵌 Tomcat / Jetty / Undertow .|
 | 启动方式 | War 包部署 | `java -jar` 直接启动 |
 | 自动装配 | 无 | `@EnableAutoConfiguration` |
 | 监控 | 需手动集成 | Actuator 开箱即用 |
